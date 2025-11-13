@@ -1,0 +1,196 @@
+%% plot_smiles_and_surfaces.m
+clear
+clc
+close all;
+% 1) Load your data (replace with manual entry if you prefer)
+T =readtable('heston_pce_grid.xlsx'); 
+
+% 2) Extract unique strikes & expiries
+strikes  = unique(T.Strike);
+expiries = unique(T.Expiry);
+nK = numel(strikes);
+nE = numel(expiries);
+
+% 3) Pre‐allocate implied‐vol matrices
+IVq = nan(nE,nK);
+IVh = nan(nE,nK);
+IVb = nan(nE,nK);
+IVi = nan(nE,nK);
+
+% 4) BS‐IV helper
+S0 = unique(T.S_0);            % should be constant
+r  = 0.045;                   % your chosen risk‐free rate
+bsiv = @(P,K,T_) blsimpv( ...  % inline Black‐Scholes IV
+    S0, K, r, T_, P, [], [], [], {'Call'});
+
+% 5) Compute IV grid
+for i = 1:nE
+    Tdays = expiries(i);
+    Tyrs  = Tdays/365;
+    
+    idx = T.Expiry==Tdays;
+    K   = T.Strike(idx);
+    Qp  = T.QuotedPrice(idx);
+    Hp  = T.Heston(idx);
+    Bp  = T.Bates(idx);
+    Ip  = T.Intrinsic(idx);
+    
+    [K,ord] = sort(K);
+    Qp = Qp(ord);  Hp = Hp(ord);
+    Bp = Bp(ord);  Ip = Ip(ord);
+    
+    for j = 1:nK
+        k = K(j);
+        if ~isnan(Qp(j))
+            IVq(i,j) = bsiv(Qp(j), k, Tyrs);
+        end
+        IVh(i,j) = bsiv(Hp(j), k, Tyrs);
+        IVb(i,j) = bsiv(Bp(j), k, Tyrs);
+        IVi(i,j) = bsiv(Ip(j), k, Tyrs);
+    end
+end
+
+%% A) Volatility Smiles: one figure per expiry
+lw = 2; fs = 20;
+for i=1:nE
+    figure('Name',sprintf('Smile—%d days',expiries(i)),'NumberTitle','off');
+    hold on
+      if any(~isnan(IVq(i,:)))
+        plot(strikes, IVq(i,:), 'ko-','LineWidth',lw,'MarkerSize',6,'DisplayName','Quoted');
+      end
+      plot(strikes, IVh(i,:), 'b.-','LineWidth',lw,'MarkerSize',6,'DisplayName','Heston');
+      plot(strikes, IVb(i,:), 'r.-','LineWidth',lw,'MarkerSize',6,'DisplayName','Bates');
+      % plot(strikes, IVi(i,:), 'g--','LineWidth',lw,'DisplayName','Intrinsic');
+    hold off
+    xlabel('Strike','FontSize',fs);
+    ylabel('Implied Volatility','FontSize',fs);
+
+    legend('Location','best','FontSize',22);
+    set(gca,'FontSize',fs,'LineWidth',1.2);
+    grid on
+    grid minor
+end
+
+%% 
+lw = 2; fs = 20;
+methods = {'Quoted','Heston','Bates','Intrinsic'};
+IVs     = {IVq, IVh, IVb, IVi};
+S0 = 423.95; % Your spot price
+
+for m = 1:4
+    for i = 1:nE
+        figure('Name', sprintf('%s Volatility Smiles', methods{m}), ...
+           'NumberTitle','off');
+        plot(strikes, IVs{m}(i,:), 'o-','LineWidth',lw,'MarkerSize',6, ...
+             'DisplayName', sprintf('%d days', expiries(i)));
+        hold on
+        % Add vertical red dotted line at S0
+        xline(S0, 'r--', 'LineWidth', 2, 'DisplayName','ATM');
+
+        % Add ITM/OTM labels (for calls: left=ITM, right=OTM)
+        ylims = ylim;
+        y_pos = ylims(1) + 0.85 * (ylims(2) - ylims(1)); % 85% up the y-axis
+        text(S0 - 10, y_pos, 'ITM', 'Color', 'red', 'FontSize', fs+2, 'HorizontalAlignment', 'right', 'FontWeight', 'bold');
+        text(S0 + 10, y_pos, 'OTM', 'Color', 'red', 'FontSize', fs+2, 'HorizontalAlignment', 'left',  'FontWeight', 'bold');
+
+        hold off
+        xlabel('Strike','FontSize',fs);
+        ylabel('Implied Volatility','FontSize',fs);
+        legend('Location','best','FontSize',fs);
+        set(gca,'FontSize',fs,'LineWidth',2);
+        grid on
+    end   
+end
+
+%% B) Volatility Surfaces: separate figure per method
+methods = {'Quoted','Heston','Bates','Intrinsic'};
+IVs     = {IVq, IVh, IVb, IVi};
+[X,Y]   = meshgrid(strikes, expiries/365);
+
+for m = 1:4
+    Z = IVs{m};
+    % fill missing for smoothness
+    Z = fillmissing(Z,'linear',2);
+    Z = fillmissing(Z,'linear',1);
+    
+    figure('Name',[methods{m} ' IV Surface'],'NumberTitle','off');
+    surfc(X, Y, Z, 'LineStyle','none');
+    shading interp
+    colormap(parula)
+    view(45,30)
+    
+    xlabel('Strike','FontSize',fs);
+    ylabel('Time to Expiry (yrs)','FontSize',fs);
+    zlabel('Implied Vol','FontSize',fs);
+    title([methods{m} ' Volatility Surface'],'FontSize',fs+2);
+    colorbar('FontSize',18);
+    set(gca,'FontSize',fs,'LineWidth',1.2);
+    grid on
+end
+
+
+
+%% 
+T =readtable('heston_pce_grid.xlsx'); 
+strikes  = unique(T.Strike);         % 395:5:450
+expiries = unique(T.Expiry);         % 24,87,115  (days)
+nK = numel(strikes);
+nE = numel(expiries);
+
+
+IVq = NaN(nE,nK);    % market quotes
+IVh = NaN(nE,nK);    % Heston prices
+IVb = NaN(nE,nK);    % Bates prices
+
+
+S0 = T.S_0(1);       % constant spot
+r  = 0.04;         % risk-free rate (annualised, continuously-comp.)
+optType = {'Call'};  % all calls
+
+% helper: inline IV solver
+bs_iv = @(P,K,T_) blsimpv(S0,K,r,T_,P,[],[],[],optType);
+
+
+for ei = 1:nE
+    Tdays = expiries(ei);
+    Tyrs  = Tdays/365;
+
+    for ki = 1:nK
+        K = strikes(ki);
+
+        % pick the row for this (expiry,strike)
+        row = T(T.Strike==K & T.Expiry==Tdays,:);
+
+        if ~isempty(row)
+            % Quoted price
+            if ~isnan(row.QuotedPrice)
+                IVq(ei,ki) = bs_iv(row.QuotedPrice, K, Tyrs);
+            end
+            % Heston price
+            if ~isnan(row.Heston)
+                IVh(ei,ki) = bs_iv(row.Heston, K, Tyrs);
+            end
+            % Bates price
+            if ~isnan(row.Bates)
+                IVb(ei,ki) = bs_iv(row.Bates, K, Tyrs);
+            end
+        end
+    end
+end
+
+plotSurf(strikes, expiries/365, IVq, 'Implied Volatility Surface – Market');
+plotSurf(strikes, expiries/365, IVh, 'Implied Volatility Surface – Heston');
+plotSurf(strikes, expiries/365, IVb, 'Implied Volatility Surface – Bates');
+
+% -----------------------------------------------------------------
+%  LOCAL FUNCTION  (place it *after* the main script or in its own m-file)
+% -----------------------------------------------------------------
+function plotSurf(Kgrid,Tgrid,Z,titleStr)
+    figure('Name',titleStr,'NumberTitle','off');
+    surf(Kgrid, Tgrid, Z,'EdgeColor','none');
+    shading interp; view(45,30);
+    colormap(parula); colorbar;
+    xlabel('Strike'); ylabel('T (years)'); zlabel('Implied vol');
+    title(titleStr);
+    set(gca,'FontSize',18,'LineWidth',1.2);
+end

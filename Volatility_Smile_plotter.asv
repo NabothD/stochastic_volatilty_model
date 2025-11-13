@@ -1,0 +1,188 @@
+%% plot_option_models_and_volsurfaces.m
+clear;
+clc;
+% 1) Load your data
+T =readtable('heston_pce_grid.xlsx'); 
+% expects columns: V_0, Strike, Expiry, QuotedPrice, Heston, Bates, V_expiry, Intrinsic
+% 2) Extract unique strikes & expiries
+%% plot_option_models_and_volsurfaces_separate.m
+% with bigger fonts & lw=1.2
+
+
+% 2) Extract unique strikes & expiries
+strikes  = unique(T.Strike);
+expiries = unique(T.Expiry);
+nK = numel(strikes);
+nE = numel(expiries);
+
+% 3) Pre-allocate IV matrices
+IV_quoted = nan(nE,nK);
+IV_heston = nan(nE,nK);
+IV_bates  = nan(nE,nK);
+IV_intr   = nan(nE,nK);
+
+% 4) BS helper
+S0 = unique(T.S_0);   % assume constant
+r  = 0.04;          % fixed rate
+bsiv = @(price,K,T_) blsimpv(S0, K, r, T_, price, [], [], [], {'Call'});
+
+
+
+%% A) Option-price vs Strike: one figure per expiry
+for i = 1:nE
+    expd = expiries(i);
+    TT   = expd/365;
+    
+    idx = T.Expiry == expd;
+    K   = T.Strike(idx);
+    Qp  = T.QuotedPrice(idx);
+    Hp  = T.Heston(idx);
+    Bp  = T.Bates(idx);
+    Ip  = T.Intrinsic(idx);
+    
+    [K,ord] = sort(K);
+    Qp = Qp(ord);  Hp = Hp(ord);
+    Bp = Bp(ord);  Ip = Ip(ord);
+    
+    % back-solve IVs for this expiry
+    for j = 1:nK
+     
+        IV_quoted(i,j) = bsiv(Qp(j), K(j), TT);
+        
+        IV_heston(i,j) = bsiv(Hp(j), K(j), TT);
+        IV_bates (i,j) = bsiv(Bp(j), K(j), TT);
+        IV_intr  (i,j) = bsiv(Ip(j), K(j), TT);
+    end
+    
+    % plot in its own figure
+    figure('Name',sprintf('Prices Expiry %d days',expd),'NumberTitle','off');
+    hold on
+      if any(~isnan(Qp))
+          plot(K, Qp, 'ko-','LineWidth',1.2,'MarkerSize',6,'DisplayName','Quoted');
+      end
+      plot(K, Hp, 'b.-','LineWidth',1.2,'MarkerSize',6,'DisplayName','Heston');
+      plot(K, Bp, 'r.-','LineWidth',1.2,'MarkerSize',6,'DisplayName','Bates');
+      plot(K, Ip, 'g--','LineWidth',1.2,'DisplayName','Intrinsic');
+    hold off
+    
+    xlabel('Strike','FontSize',14);
+    ylabel('Option Price','FontSize',14);
+    title(sprintf('Expiry = %d days', expd),'FontSize',16);
+    legend('Location','best','FontSize',12);
+    set(gca,'FontSize',14);
+    grid on
+end
+
+
+
+% %% B) IV surface: one figure per method
+% methods = {'Quoted','Heston','Bates','Intrinsic'};
+% IVs     = {IV_quoted, IV_heston, IV_bates, IV_intr};
+% [X,Y]   = meshgrid(strikes, expiries/365);
+% 
+% for m = 1:4
+%     figure('Name',sprintf('%s IV Surface',methods{m}),'NumberTitle','off');
+%     surf(X, Y, IVs{m}, 'EdgeColor','k','LineWidth',1.2);
+%     view(45,30);
+%     xlabel('Strike','FontSize',14);
+%     ylabel('Time to Expiry (yrs)','FontSize',14);
+%     zlabel('Implied Volatility','FontSize',14);
+%     title([methods{m} ' IV Surface'],'FontSize',16);
+%     colorbar('FontSize',12);
+%     set(gca,'FontSize',14);
+% end
+
+
+%% B) Smoothed & “right‐way‐up” IV surfaces (one figure per method)
+methods = {'Quoted','Heston','Bates','Intrinsic'};
+IVs     = {IV_quoted, IV_heston, IV_bates, IV_intr};
+[X,Y]   = meshgrid(strikes, expiries/365);
+
+% global color‐limits
+allIV = vertcat(IV_quoted(:), IV_heston(:), IV_bates(:), IV_intr(:));
+vmin  = prctile(allIV,1);
+vmax  = prctile(allIV,99);
+
+for m = 1:4
+    Z = IVs{m};           % your raw IV matrix: size(Z) == [nE x nK]?
+    
+    % 1) If it doesn’t match meshgrid size, transpose it
+    if ~isequal(size(Z), size(X))
+        Z = Z.';
+    end
+    
+    % 2) Fill missing values
+    Z = fillmissing(Z,'linear',2);  % across strikes
+    Z = fillmissing(Z,'linear',1);  % across expiries
+    
+    % 3) Plot
+    figure('Name',sprintf('%s IV Surface',methods{m}),'NumberTitle','off');
+    surfc(X, Y, Z, 'LineStyle','none');
+    shading interp;
+    colormap(parula);
+    % clim([vmin vmax]);
+    % view(45,30);
+    % 
+    % 4) Labels / styling
+    xlabel('Strike','FontSize',14);
+    ylabel('Time to Expiry (yrs)','FontSize',14);
+    zlabel('Implied Volatility','FontSize',14);
+    title([methods{m} ' IV Surface'],'FontSize',16);
+    colorbar('FontSize',12);
+    set(gca,'FontSize',14,'LineWidth',1.2);
+    grid on;
+end
+
+
+%%
+lw = 1.2;    % line width
+fs = 18;     % font size
+
+% 3) Loop expiries → compute IVs & plot smile
+for i = 1:numel(expiries)
+    expd = expiries(i);
+    TT   = expd/365;
+    
+    % select this expiry’s rows
+    idx = T.Expiry == expd;
+    K   = T.Strike(idx);
+    Qp  = T.QuotedPrice(idx);
+    Hp  = T.Heston(idx);
+    Bp  = T.Bates(idx);
+    Ip  = T.Intrinsic(idx);
+    
+    % sort by strike
+    [K,ord] = sort(K);
+    Qp = Qp(ord);  Hp = Hp(ord);
+    Bp = Bp(ord);  Ip = Ip(ord);
+    
+    % back‐solve IVs
+    IVq = nan(size(K));  IVh = IVq;  IVb = IVq;  IVi = IVq;
+    for j = 1:numel(K)
+        % if ~isnan(Qp(j))
+        %     IVq(j) = blsimpv(S0, K(j), r, TT, Qp(j), [], [], [], {'Call'});
+        % end
+        IVh(j) = blsimpv(S0, K(j), r, TT, Hp(j), [], [], [], {'Call'});
+        % IVb(j) = blsimpv(S0, K(j), r, TT, Bp(j), [], [], [], {'Call'});
+        IVi(j) = blsimpv(S0, K(j), r, TT, Qp(j), [], [], [], {'Call'});
+    end
+    
+    % plot the smile
+    figure('Name',sprintf('Vol Smile — Expiry %d days',expd),'NumberTitle','off');
+    hold on
+      % if any(~isnan(IVq))
+      %   plot(K, IVq, 'ko-','LineWidth',lw,'MarkerSize',6,'DisplayName','Market');
+      % end
+      plot(K, IVh, 'b.-','LineWidth',lw,'MarkerSize',6,'DisplayName','Heston');
+      % plot(K, IVb, 'r.-','LineWidth',lw,'MarkerSize',6,'DisplayName','Bates');
+      plot(K, IVi, 'g--','LineWidth',lw,'DisplayName','Quoted');
+    hold off
+    
+    xlabel('Strike','FontSize',fs);
+    ylabel('Implied Volatility','FontSize',fs);
+    title(sprintf('Volatility Smile (Expiry = %d days)',expd),'FontSize',fs);
+    legend('Location','best','FontSize',12);
+    set(gca,'FontSize',fs);
+    grid on
+    grid minor
+end

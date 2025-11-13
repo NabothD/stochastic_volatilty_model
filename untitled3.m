@@ -1,0 +1,104 @@
+%----------------------------------------------------------
+% illustrative_smile_sensitivities.m
+%
+% Requires: Financial Toolbox (for blsimpv) and a light-weight
+%           Heston pricer below (Lewis/Cui form).
+%----------------------------------------------------------
+clear; clc;
+
+%% 0. Market inputs
+S0   = 100;        % spot
+r    = 0.02;       % risk-free rate
+Tmat = 0.25;       % 3-month expiry (years)
+K    = (70:5:130)';% strikes for smile
+
+%% 1. Baseline Heston parameters (equity-style)
+par0.kappa  = 2.0;      % mean-reversion
+par0.theta  = 0.04;     % long-run var  (vol² ≈ 20 %)
+par0.sigma  = 0.6;      % vol-of-vol
+par0.rho    = -0.6;     % leverage
+par0.v0     = 0.04;     % initial var
+
+%% 2. Five parameter scenarios
+scen = { ...
+  par0,                                            'baseline'; ...
+  setfield(par0,'v0'   ,0.07 ),                    'higher v_0'; ...
+  setfield(par0,'sigma',1.0 ),                     'higher \sigma'; ...
+  setfield(par0,'rho'  ,-0.9),                     'more negative \rho'; ...
+  setfield(par0,'kappa',0.5 ),                     'lower \kappa' ...
+};
+
+col = {'k','b','r','g','m'};    % colours
+sty = {'-','-','-','-','-'};    % same style
+lw  = [2.5 1.4 1.4 1.4 1.4];
+
+figure('Name','Heston smile sensitivities','NumberTitle','off'); hold on
+nScen = size(scen,1);          % = 5 rows
+for s = 1:nScen
+    p     = scen{s,1};         % parameter struct
+    label = scen{s,2};         % text label
+  
+    % price each strike via Heston analytic, then invert to IV
+    iv = zeros(numel(K),1);
+    for k = 1:numel(K)
+        P = heston_price_call_cf(S0,K(k),Tmat,r,p);     % below
+        Cintr = max(S0 - K(k)*exp(-r*Tmat), 0);
+        P     = max(P, Cintr + 1e-8);              % nudge just above intrinsic
+        iv(k) = blsimpv(S0,K(k),r,Tmat,P,[],[],[],{'Call'});
+
+    end
+    
+    plot(K, iv, [col{s} sty{s}], 'LineWidth', lw(s), 'DisplayName',label);
+end
+xlabel('Strike'); ylabel('Black–Scholes IV'); grid on;
+title('How each Heston parameter affects the 3-month smile');
+
+legend('Location','northwest');
+
+%% 3. Annotate arrows (quick & dirty positions)
+% arrow for v0 shift
+annotation('textarrow',[0.25 0.25],[0.7 0.83], ...
+           'String','$\uparrow v_0 \;$ lifts level', ...
+           'Interpreter','latex','FontSize',11);
+
+% arrow for sigma deepening
+annotation('textarrow',[0.45 0.38],[0.27 0.38], ...
+           'String','$\uparrow \sigma$ deepens wings', ...
+           'Interpreter','latex','FontSize',11);
+
+% arrow for rho skew
+annotation('textarrow',[0.63 0.58],[0.55 0.45], ...
+           'String','more negative $\rho$ $\rightarrow$ steeper left wing', ...
+           'Interpreter','latex','FontSize',11);
+
+% arrow for kappa persistence
+annotation('textarrow',[0.78 0.72],[0.39 0.31], ...
+           'String','lower $\kappa$ keeps skew persistent', ...
+           'Interpreter','latex','FontSize',11);
+
+set(gca,'FontSize',12,'LineWidth',1.2); ylim([0.1 0.5]);
+
+
+
+function price = heston_price_call_cf(S0,K,T,r,p)
+% quick analytic Heston price (risk-neutral)
+kappa=p.kappa; theta=p.theta; sigma=p.sigma; rho=p.rho; v0=p.v0;
+
+% characteristic func (Lewis, 2001)
+d = @(u) sqrt( (rho*sigma*1i*u - kappa).^2 + sigma^2*(1i*u+u.^2) );
+g = @(u) (kappa - rho*sigma*1i*u - d(u)) ./ (kappa - rho*sigma*1i*u + d(u));
+C = @(u) r*1i*u*T + ...
+    (kappa*theta/sigma^2) * ( (kappa - rho*sigma*1i*u - d(u))*T ...
+    - 2*log( (1 - g(u).*exp(-d(u)*T))./(1-g(u)) ) );
+D = @(u) ((kappa - rho*sigma*1i*u - d(u))./sigma^2) .* ...
+         (1 - exp(-d(u)*T)) ./ (1 - g(u).*exp(-d(u)*T));
+
+phi = @(u) exp( C(u) + D(u)*v0 + 1i*u*log(S0) );
+
+% Carr-Madan price via 2-pt Gauss for P1,P2
+P = @(j) 0.5 + (1/pi)*integral( @(u) real( exp(-1i*u*log(K)) ...
+    .*phi(u - 1i*(j-1)) ./ (1i*u) ), 0, 100 );
+
+P1 = P(1);  P2 = P(2);
+price = S0*P1 - K*exp(-r*T)*P2;
+end

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "svuq"
+version = "1.0.0"
+description = "Bayesian estimation and uncertainty quantification for the Heston and Bates stochastic-volatility models"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.9",
+    "pandas>=1.4",
+    "matplotlib>=3.5",
+    "chaospy>=4.3",
+    "openpyxl>=3.0",
+]
+
+[project.optional-dependencies]
+quantlib = ["QuantLib>=1.30"]
+data = ["yfinance>=0.2"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

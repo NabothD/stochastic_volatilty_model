@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from collections.abc import Sequence
 
-import matplotlib
-
-matplotlib.use("Agg") if matplotlib.get_backend().lower() == "agg" else None
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import gaussian_kde
@@ -17,14 +14,27 @@ LABELS = {"mu": r"$\mu$", "kappa": r"$\kappa$", "theta": r"$\theta$", "sigma": r
           "rho": r"$\rho$", "lam": r"$\lambda$", "mu_j": r"$\mu_J$", "sigma_j": r"$\sigma_J$"}
 
 
-def plot_posteriors(result: PosteriorResult, true_values: Optional[Dict[str, float]] = None,
-                    names: Optional[Sequence[str]] = None, ncols: int = 4):
+def plot_posteriors(result: PosteriorResult, true_values: dict[str, float] | None = None,
+                    names: Sequence[str] | None = None, ncols: int = 4) -> plt.Figure:
+    """Plot posterior histograms with KDE, 95% interval and optional true values.
+
+    Parameters
+    ----------
+    result : estimator output.
+    true_values : optional true parameters (dict or parameter object).
+    names : parameters to plot (default: all).
+    ncols : panels per row.
+
+    Returns
+    -------
+    matplotlib Figure.
+    """
     names = list(names or result.param_names)
     if true_values is not None and hasattr(true_values, "to_dict"):
         true_values = true_values.to_dict()
     nrows = int(np.ceil(len(names) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 2.8 * nrows), squeeze=False)
-    for ax, p in zip(axes.flat, names):
+    for ax, p in zip(axes.flat, names, strict=False):
         x = result.samples[p].to_numpy()
         ax.hist(x, bins=40, density=True, alpha=0.35, color="C0")
         if np.ptp(x) > 0:
@@ -43,11 +53,23 @@ def plot_posteriors(result: PosteriorResult, true_values: Optional[Dict[str, flo
     return fig
 
 
-def plot_traces(result: PosteriorResult, names: Optional[Sequence[str]] = None):
+def plot_traces(result: PosteriorResult, names: Sequence[str] | None = None) -> plt.Figure:
+    """Plot the trace of each parameter for every chain, with the burn-in marked.
+
+    Parameters
+    ----------
+    result : estimator output.
+    names : parameters to plot (default: all).
+
+    Returns
+    -------
+    matplotlib Figure.
+    """
     names = list(names or result.param_names)
     fig, axes = plt.subplots(len(names), 1, figsize=(9, 1.5 * len(names)), sharex=True)
-    for ax, p in zip(np.atleast_1d(axes), names):
-        ax.plot(result.chain[p].to_numpy(), lw=0.6)
+    for ax, p in zip(np.atleast_1d(axes), names, strict=False):
+        for chain in result.chains:
+            ax.plot(chain.draws[p].to_numpy(), lw=0.6)
         ax.axvline(result.burn_in, color="r", ls=":", lw=1)
         ax.set_ylabel(LABELS.get(p, p))
     np.atleast_1d(axes)[-1].set_xlabel("sweep")
@@ -55,9 +77,22 @@ def plot_traces(result: PosteriorResult, names: Optional[Sequence[str]] = None):
     return fig
 
 
-def plot_variance(result: PosteriorResult, true_variance: Optional[np.ndarray] = None,
-                  t: Optional[np.ndarray] = None, as_vol: bool = True):
-    paths = result.vol_paths[result.burn_in:]
+def plot_variance(result: PosteriorResult, true_variance: np.ndarray | None = None,
+                  t: np.ndarray | None = None, as_vol: bool = True) -> plt.Figure:
+    """Plot the posterior latent volatility (or variance) path with a 95% band.
+
+    Parameters
+    ----------
+    result : estimator output.
+    true_variance : optional true variance path to overlay.
+    t : optional x-axis values.
+    as_vol : plot ``sqrt(V)`` instead of ``V``.
+
+    Returns
+    -------
+    matplotlib Figure.
+    """
+    paths = result.vol_paths
     f = np.sqrt if as_vol else (lambda z: z)
     lo, hi = np.percentile(f(paths), [2.5, 97.5], axis=0)
     t = np.arange(paths.shape[1]) if t is None else t
@@ -73,8 +108,20 @@ def plot_variance(result: PosteriorResult, true_variance: Optional[np.ndarray] =
     return fig
 
 
-def plot_price_distribution(prices: np.ndarray, true_price: Optional[float] = None,
-                            label: str = "option price"):
+def plot_price_distribution(prices: np.ndarray, true_price: float | None = None,
+                            label: str = "option price") -> plt.Figure:
+    """Plot a histogram of option prices across posterior draws.
+
+    Parameters
+    ----------
+    prices : prices (any shape, flattened).
+    true_price : optional reference price.
+    label : x-axis label.
+
+    Returns
+    -------
+    matplotlib Figure.
+    """
     prices = np.asarray(prices).ravel()
     fig, ax = plt.subplots(figsize=(5, 3.5))
     ax.hist(prices, bins=40, alpha=0.7, color="C0", edgecolor="white")

@@ -2,9 +2,10 @@ numpy>=1.22
 scipy>=1.9
 pandas>=1.4
 matplotlib>=3.5
-chaospy>=4.3
+numba>=0.59
 openpyxl>=3.0
 pytest>=7
 # optional
+chaospy>=4.3        # only for scipy_to_chaospy
 QuantLib>=1.30      # only for cross-checking the pricer
 yfinance>=0.2       # only for downloading prices

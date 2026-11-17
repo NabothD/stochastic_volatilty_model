@@ -26,16 +26,19 @@ Section 4.6.  Two corrections relative to the thesis text are built in:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Optional, Tuple
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
-MeanSd = Tuple[float, float]
+from .models import BatesParams, HestonParams, Params
+
+MeanSd = tuple[float, float]
 
 
 @dataclass
 class Priors:
+    """Conjugate prior hyper-parameters (see the module docstring for their meaning)."""
+
     eta_mean: float
     eta_prec: float
     beta_mean: np.ndarray
@@ -54,10 +57,11 @@ class Priors:
     sigma_j_a: float = 3.0
     sigma_j_b: float = 0.02
     # initial variance V_0 ~ Gamma with this mean / sd (None -> use theta)
-    v0_mean: Optional[float] = None
-    v0_sd: Optional[float] = None
+    v0_mean: float | None = None
+    v0_sd: float | None = None
 
     def __post_init__(self) -> None:
+        """Coerce array shapes and check that scale / shape parameters are positive."""
         self.beta_mean = np.asarray(self.beta_mean, dtype=float).reshape(2)
         self.beta_prec = np.asarray(self.beta_prec, dtype=float).reshape(2, 2)
         for name in ("eta_prec", "sigma_a", "sigma_b", "psi_prec", "omega_a", "omega_b",
@@ -66,12 +70,39 @@ class Priors:
                 raise ValueError(f"prior hyper-parameter {name} must be > 0")
 
     def to_dict(self) -> dict:
+        """Return the hyper-parameters as a JSON-serialisable dict."""
         d = asdict(self)
         d["beta_mean"] = self.beta_mean.tolist()
         d["beta_prec"] = self.beta_prec.tolist()
         return d
 
-    # ------------------------------------------------------------------
+    def initial_params(self, model: str, dt: float) -> Params:
+        """Return a starting point for the sampler: the prior means.
+
+        Parameters
+        ----------
+        model : ``"heston"`` or ``"bates"``.
+        dt : time step in years.
+
+        Returns
+        -------
+        ``HestonParams`` or ``BatesParams``.
+        """
+        kappa = max((1.0 - self.beta_mean[1]) / dt, 1e-2)
+        w0 = self.omega_b / max(self.omega_a - 1.0, 1e-3)
+        base = dict(
+            mu=(self.eta_mean - 1.0) / dt,
+            kappa=kappa,
+            theta=max(self.beta_mean[0] / (kappa * dt), 1e-4),
+            sigma=float(np.sqrt(self.sigma_b / max(self.sigma_a - 1.0, 1e-3))),
+            rho=float(np.clip(self.psi_mean / np.sqrt(self.psi_mean ** 2 + w0), -0.95, 0.95)),
+        )
+        if model == "heston":
+            return HestonParams(**base)
+        sigma_j = float(np.sqrt(self.sigma_j_b / max(self.sigma_j_a - 1.0, 1e-3)))
+        return BatesParams(**base, lam=self.lam_a / self.lam_b, mu_j=self.mu_j_mean,
+                           sigma_j=sigma_j)
+
     @classmethod
     def from_beliefs(
         cls,
@@ -82,14 +113,27 @@ class Priors:
         sigma: float = 0.3,
         sigma_strength: float = 3.0,
         rho: MeanSd = (-0.5, 0.3),
-        omega_mean: Optional[float] = None,
+        omega_mean: float | None = None,
         lam: MeanSd = (1.0, 1.0),
         mu_j: MeanSd = (-0.05, 0.2),
         sigma_j: float = 0.1,
         sigma_j_strength: float = 3.0,
-        v0: Optional[MeanSd] = None,
-    ) -> "Priors":
+        v0: MeanSd | None = None,
+    ) -> Priors:
         """Build hyper-parameters from intuitive (mean, sd) beliefs.
+
+        Parameters
+        ----------
+        dt : time step in years.
+        mu, kappa, theta, rho, lam, mu_j : (mean, sd) of each parameter.
+        sigma, sigma_j : prior mean of the vol-of-vol / jump-size std.
+        sigma_strength, sigma_j_strength : inverse-gamma shapes (> 1).
+        omega_mean : prior mean of ``omega`` (default ``sigma^2 (1 - rho^2)``).
+        v0 : optional (mean, sd) of the initial variance.
+
+        Returns
+        -------
+        Priors
 
         ``sigma_strength`` / ``sigma_j_strength`` are the inverse-gamma shape
         parameters (must be > 1).  Shape ``a`` is worth roughly ``2a``
@@ -140,8 +184,17 @@ class Priors:
                    v0_mean, v0_sd)
 
     @classmethod
-    def thesis_synthetic(cls, dt: float = 1 / 252) -> "Priors":
-        """Hyper-parameters of Table 3 (with precisions as written in the report)."""
+    def thesis_synthetic(cls, dt: float = 1 / 252) -> Priors:
+        """Return the hyper-parameters of thesis Table 3 (precisions as written there).
+
+        Parameters
+        ----------
+        dt : time step in years (unused, kept for a uniform signature).
+
+        Returns
+        -------
+        Priors
+        """
         return cls(
             eta_mean=1.00125, eta_prec=1.0 / 0.001 ** 2,
             beta_mean=[35e-6, 0.988], beta_prec=[[10.0, 0.0], [0.0, 5.0]],

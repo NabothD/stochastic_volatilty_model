@@ -1,20 +1,32 @@
-"""svuq – uncertainty quantification for stochastic-volatility models.
+"""svuq: uncertainty quantification for stochastic-volatility models.
 
-Bayesian (particle filter + Gibbs) estimation of Heston and Bates parameters
-from asset prices, semi-analytic option pricing, and propagation of the
-parameter posterior into option prices (Monte Carlo and polynomial chaos).
+Bayesian (particle filter + Gibbs) estimation of Heston and Bates
+parameters from asset prices, vectorised option pricing, propagation of
+the posterior into option prices, and online volatility forecasting.
 """
 
-from .models import BatesParams, HestonParams, SimulatedPath, simulate
+from . import plotting
+from .estimation import Estimator, GibbsSampler, PosteriorResult, SamplerConfig
+from .filtering import FilterResult, ParticleFilter
+from .forecasting import Nowcast, VolatilityForecaster
+from .models import BatesParams, HestonParams, SimulatedPath, make_params, simulate
+from .pricing import (
+                      FourierPricer,
+                      bates_call,
+                      black_scholes_call,
+                      heston_call,
+                      implied_volatility,
+                      intrinsic_value,
+)
 from .priors import Priors
-from .particle_filter import run_filter
-from .estimation import PosteriorResult, estimate
-from .pricing import (bates_call, black_scholes_call, heston_call, implied_volatility,
-                      intrinsic_value)
+from .uq import OptionSpec, PCESurrogate, PosteriorPricer, PriceDistribution, posterior_draws
 
 __all__ = [
-    "HestonParams", "BatesParams", "SimulatedPath", "simulate", "Priors", "run_filter",
-    "estimate", "PosteriorResult", "heston_call", "bates_call", "black_scholes_call",
-    "implied_volatility", "intrinsic_value",
+    "BatesParams", "Estimator", "FilterResult", "FourierPricer", "GibbsSampler",
+    "HestonParams", "Nowcast", "OptionSpec", "ParticleFilter", "PCESurrogate",
+    "PosteriorPricer", "PosteriorResult", "PriceDistribution", "Priors", "SamplerConfig",
+    "SimulatedPath", "VolatilityForecaster", "bates_call", "black_scholes_call",
+    "heston_call", "implied_volatility", "intrinsic_value", "make_params",
+    "plotting", "posterior_draws", "simulate",
 ]
-__version__ = "1.0.0"
+__version__ = "2.0.0"

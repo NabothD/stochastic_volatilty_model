@@ -22,81 +22,95 @@ comparing with the thesis results.
 ## Layout
 
 ```
-src/svuq/            the package
-  models.py          parameter classes, Euler simulator (Heston / Bates)
-  priors.py          conjugate priors, built from intuitive (mean, sd) beliefs
-  bayes.py           conjugate posterior draws: mu, (kappa, theta, sigma), rho, jumps
-  particle_filter.py vectorised SIR filter, refined resampling, backward sampling
-  estimation.py      Gibbs sampler -> PosteriorResult (summary, CSV export)
-  pricing.py         Heston / Bates call prices (Lewis formula), implied vol
-  uq.py              posterior Monte Carlo pricing, PCE surrogate, Sobol indices
-  diagnostics.py     ESS, R-hat, autocorrelation
-  plotting.py        posterior / trace / variance-path / price figures
-  data.py            CSV/XLSX loading, optional Yahoo Finance download
+src/svuq/
+  models.py        HestonParams / BatesParams (frozen dataclasses), simulate()
+  priors.py        Priors: conjugate hyper-parameters from intuitive (mean, sd) beliefs
+  conjugate.py     ConjugateSampler: posterior draws of mu, (kappa, theta, sigma), rho, jumps
+  kernels.py       numba-compiled filter / resampling / backward-sampling kernels (nogil, cached)
+  filtering.py     ParticleFilter: typed wrapper around the kernels (batch and online step)
+  estimation.py    SamplerConfig, GibbsSampler (one chain), Estimator (parallel chains),
+                   PosteriorResult (summary with ESS and R-hat, CSV export)
+  pricing.py       FourierPricer: vectorised Heston / Bates call prices; Black–Scholes, implied vol
+  uq.py            PosteriorPricer (exact, vectorised), PCESurrogate (Hermite PCE + copula, Sobol)
+  forecasting.py   VolatilityForecaster: online now-casts and volatility forecasts with bands
+  parallel.py      process_map / thread_map helpers
+  diagnostics.py   ESS, R-hat, autocorrelation, MSE
+  plotting.py      posterior / trace / variance-path / price figures
+  data.py          CSV/XLSX loading, optional Yahoo Finance download
 scripts/
-  run_synthetic.py   full pipeline on simulated data with known parameters
-  run_real_data.py   estimate on market prices and price an option chain
-tests/               pytest suite (pricing vs QuantLib, filter, conjugate updates, PCE, sampler)
-data/                raw price data and the 11-Jun-1997 S&P 100 option quotes (thesis Table 7)
-results/thesis/      parameter / volatility samples produced for the thesis
-figures/thesis/      figures used in the thesis
-legacy/              original Python and MATLAB scripts (for reference only)
-docs/CODE_REVIEW.md  issues found in the original code and how they were fixed
+  run_synthetic.py       full pipeline on simulated data with known parameters
+  run_real_data.py       estimate on market prices and price an option chain
+  forecast_volatility.py fit, then stream new prices through the online forecaster
+tests/                   pytest suite (67 tests, ~15 s)
+data/                    raw price data and the 11-Jun-1997 S&P 100 option quotes
+results/thesis/          parameter / volatility samples produced for the thesis
+figures/thesis/          figures used in the thesis
+legacy/                  original Python and MATLAB scripts (for reference only)
+docs/                    CODE_REVIEW.md (issues fixed), RESULTS.md (synthetic experiments)
 ```
 
 ## Install
+
+Requires Python ≥ 3.10.
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-Add the `quantlib` extra to cross-check prices against QuantLib, and the
-`data` extra to download prices with yfinance:
+Add the extras to cross-check prices against QuantLib, use chaospy
+distributions, and download prices:
 
 ```bash
-pip install -e ".[dev,quantlib,data]"
+pip install -e ".[dev,quantlib,chaospy,data]"
 ```
 
-Run the tests:
+Run the tests and the linter:
 
 ```bash
 pytest
 ```
 
-The suite runs in about 30 s.
+```bash
+ruff check src scripts tests
+```
 
 ## Quick start
 
 ```python
 import numpy as np
-from svuq import BatesParams, Priors, simulate, estimate
-from svuq.uq import posterior_table, posterior_mc_prices, pce_prices
+from svuq import (BatesParams, Estimator, OptionSpec, PCESurrogate, PosteriorPricer, Priors,
+                  SamplerConfig, VolatilityForecaster, posterior_draws, simulate)
 
-dt = 1 / 252
-truth = BatesParams(mu=0.08, kappa=3.0, theta=0.04, sigma=0.4, rho=-0.7,
-                    lam=1.0, mu_j=-0.1, sigma_j=0.1)
-sim = simulate(truth, S0=100, T=3, n_steps=756, seed=1)
+if __name__ == "__main__":          # needed: chains run in separate processes
+    dt = 1 / 252
+    truth = BatesParams(mu=0.08, kappa=3.0, theta=0.04, sigma=0.4, rho=-0.7,
+                        lam=1.0, mu_j=-0.1, sigma_j=0.1)
+    sim = simulate(truth, S0=100, T=3, n_steps=756, seed=1)
 
-priors = Priors.from_beliefs(dt, kappa=(2, 2), theta=(0.05, 0.05), sigma=0.3,
-                             rho=(-0.3, 0.4), lam=(1, 1), mu_j=(-0.05, 0.3))
-post = estimate(sim.prices, dt, model="bates", priors=priors,
-                n_iter=2000, n_particles=1000, seed=0, progress=True)
-print(post.summary(truth))          # mean, sd, 95% CI, ESS, error, coverage
+    # 1. Estimate: 4 chains in parallel
+    priors = Priors.from_beliefs(dt, kappa=(2, 2), theta=(0.05, 0.05), sigma=0.3,
+                                 rho=(-0.3, 0.4), lam=(1, 1), mu_j=(-0.05, 0.3))
+    estimator = Estimator("bates", priors, SamplerConfig(n_iter=2000, n_particles=1000))
+    post = estimator.fit(sim.prices, dt, n_chains=4, n_jobs=4, seed=0, progress=True)
+    print(post.summary(truth))      # mean, sd, 95% CI, ESS, R-hat, error, coverage
 
-draws = posterior_table(post)        # adds v0 = filtered variance at the last date
-mc  = posterior_mc_prices(draws, "bates", S0=sim.prices[-1], K=[95, 100, 110], T=1/12, r=0.05)
-pce = pce_prices(draws, "bates", S0=sim.prices[-1], K=[95, 100, 110], T=1/12, r=0.05, order=3)
-print(mc.summary());  print(pce.mean, pce.std);  print(pce.sobol_total)
+    # 2. Option-price uncertainty
+    draws = posterior_draws(post)   # adds v0 = filtered variance at the last date
+    option = OptionSpec(S0=sim.prices[-1], strikes=[95, 100, 110], T=1 / 12, r=0.05)
+    mc = PosteriorPricer("bates").price(draws, option)          # exact, all draws
+    pce = PCESurrogate("bates", order=3).fit(draws, option)      # surrogate + Sobol
+    print(mc.summary(), pce.mean, pce.std, pce.sobol_total, sep="\n")
+
+    # 3. Volatility now-cast and forecast, updated online
+    forecaster = VolatilityForecaster(post, n_draws=100).initialise(sim.prices)
+    print(forecaster.forecast([1, 5, 21]))
+    # live: forecaster.update(new_price) -> Nowcast   (a few ms per price)
 ```
 
 From the command line:
 
 ```bash
-python scripts/run_synthetic.py --model heston --preset realistic --iter 2000
-```
-
-```bash
-python scripts/run_synthetic.py --model bates  --preset thesis    --iter 2000
+python scripts/run_synthetic.py --model heston --preset realistic --iter 2000 --chains 4
 ```
 
 ```bash
@@ -104,11 +118,45 @@ python scripts/run_real_data.py --ticker ^OEX --start 1994-06-11 --end 1997-06-1
 ```
 
 ```bash
-python scripts/run_real_data.py --data data/raw/sp500_historical.xlsx --models heston
+python scripts/forecast_volatility.py --data data/raw/sp500_historical.xlsx --model heston --holdout 10
 ```
 
-Each run writes its chain, summary, variance path, option-price report and
-figures to `results/`.
+Each run writes its chains, summary, variance path, reports and figures to
+`results/`.
+
+## Performance
+
+Timings are for 3 years of daily data on one core of the development
+machine.
+
+| | original scripts | `svuq` |
+|---|---|---|
+| Gibbs sweep, 200 particles | 1.44 s | 9–14 ms (**100–150×**) |
+| Gibbs sweep, 1000 particles | 32.7 s | 44–85 ms (**390–740×**) |
+| 4 chains × 2000 sweeps, 1000 particles | ~3 days (serial) | ~3 min (4 processes) |
+| 500 posterior draws × 36 strikes | ~20–60 s (adaptive quadrature per price) | ~0.15 s |
+| Online volatility update (100 draws × 500 particles) | not available | ~3–7 ms |
+
+The sweep timings include drawing a full variance path by backward sampling,
+which the original code did not do. The lower figures are with
+`resampling="systematic"`; the default `"smooth"` matches the thesis.
+
+How the speed was achieved:
+- **Compiled kernels.** The particle filter, both resampling schemes and the
+  backward sampler are numba kernels. They are compiled once and cached on
+  disk, and release the GIL.
+- **Parallel chains.** `Estimator.fit(n_chains=…, n_jobs=…)` runs chains in
+  separate processes. That also gives R-hat convergence checks.
+- **Threaded forecaster.** The `VolatilityForecaster` filters one cloud per
+  posterior draw in threads.
+- **Vectorised pricing.** All strikes and parameter sets share one composite
+  Gauss–Legendre grid, so a whole posterior × option-chain grid costs two
+  matrix products. It agrees with adaptive quadrature to 1e-8 and with
+  QuantLib to 1e-8 (tests).
+- **No chaospy in the PCE.** It uses an orthonormal Hermite basis in numpy;
+  mean, variance and Sobol indices come straight from the coefficients.
+- **Reproducibility.** Every kernel call is seeded from a
+  `numpy.random.Generator`, so results are reproducible for a given seed.
 
 ## Method in brief
 
@@ -121,7 +169,7 @@ V_k = V_{k-1} + kappa (theta - V_{k-1}) dt + sigma sqrt(V_{k-1} dt) eps^V_k,   c
 
 Each Gibbs sweep does four things:
 
-1. **Particle filter.** Particles of `V_{k-1}` (and, for Bates, a proposed
+1. **Particle filter** (`ParticleFilter`). Particles of `V_{k-1}` (and, for Bates, a proposed
    jump `(J_k, Z_k)`) are weighted by `p(R_k | ·)`. They are then resampled
    with refined (continuous) resampling and propagated to `V_k`, using the
    variance shock correlated with the price shock implied by `R_k`. The

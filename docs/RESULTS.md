@@ -16,7 +16,7 @@ about 7–10 minutes on one CPU core.
 Reproduce:
 
 ```bash
-python scripts/run_synthetic.py --model heston --preset realistic --iter 2000
+python scripts/run_synthetic.py --model heston --preset realistic --iter 2000 --chains 1
 ```
 
 ## Heston, realistic parameters

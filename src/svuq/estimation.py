@@ -1,265 +1,423 @@
 """Bayesian estimation of Heston / Bates parameters from a price series.
 
-The sampler follows the two-stage MCMC + SIR scheme used
-in the thesis (Section 4.7): each sweep
+Each Gibbs sweep (thesis Section 4.7, corrected):
 
-1. runs the particle filter for the latent variance (and jumps) given the
-   current parameters,
-2. (Bates) draws jump times/sizes and the jump parameters, and removes the
-   sampled jumps from the returns,
-3. picks a variance path – either the filtered mean (``path="mean"``, as in
-   the thesis) or a trajectory drawn by backward sampling
-   (``path="ffbs"``, the default) – and
-4. draws ``mu``, ``(kappa, theta, sigma)`` and ``rho`` from their conjugate
-   regression posteriors given that path.
+1. run the particle filter for the latent variance (and jumps),
+2. (Bates) draw jump times/sizes and the jump parameters; remove the jumps
+   from the returns,
+3. take a variance path: a backward-sampled trajectory (``path="ffbs"``,
+   default) or the filtered mean (``path="mean"``, thesis method),
+4. draw ``mu``, ``(kappa, theta, sigma)`` and ``rho`` from their conjugate
+   regression posteriors.
 
-The stored draws after ``burn_in`` are the posterior sample used for
-uncertainty quantification.
+:class:`Estimator` runs one or more independent chains (in parallel
+processes) and returns a :class:`PosteriorResult`.
 """
 
 from __future__ import annotations
 
 import time
 import warnings
-from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Sequence, Union
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
 
-from . import bayes
-from .diagnostics import effective_sample_size
-from .models import BATES_PARAMS, HESTON_PARAMS, BatesParams, HestonParams
-from .particle_filter import backward_sample, run_filter
+from .conjugate import ConjugateSampler
+from .diagnostics import effective_sample_size, gelman_rubin
+from .filtering import ParticleFilter
+from .models import BATES_PARAMS, HESTON_PARAMS, HestonParams, Params, make_params
+from .parallel import process_map
 from .priors import Priors
+
+ProgressFn = Callable[[int, dict[str, float]], None]
+
+
+@dataclass(frozen=True)
+class SamplerConfig:
+    """Settings of the particle-filter Gibbs sampler.
+
+    Attributes
+    ----------
+    n_iter : number of Gibbs sweeps per chain.
+    burn_in : sweeps discarded at the start of each chain (default ``n_iter // 4``).
+    n_particles : particles in the filter.
+    path : ``"ffbs"`` (backward-sampled path) or ``"mean"`` (filtered mean, thesis).
+    resampling : ``"smooth"`` (refined, thesis) or ``"systematic"``.
+    jump_update : ``"gibbs"`` (conjugate draws) or ``"moments"`` (thesis Eqs. 80–83).
+    jump_proposal_prob : minimum probability of proposing a jump in the filter.
+    """
+
+    n_iter: int = 2000
+    burn_in: int | None = None
+    n_particles: int = 1000
+    path: str = "ffbs"
+    resampling: str = "smooth"
+    jump_update: str = "gibbs"
+    jump_proposal_prob: float = 0.1
+
+    def __post_init__(self) -> None:
+        """Validate the settings."""
+        if self.path not in ("ffbs", "mean"):
+            raise ValueError("path must be 'ffbs' or 'mean'")
+        if self.jump_update not in ("gibbs", "moments"):
+            raise ValueError("jump_update must be 'gibbs' or 'moments'")
+        if not 0 <= self.effective_burn_in < self.n_iter:
+            raise ValueError("burn_in must be in [0, n_iter)")
+
+    @property
+    def effective_burn_in(self) -> int:
+        """Burn-in actually used (``n_iter // 4`` if not set)."""
+        return self.n_iter // 4 if self.burn_in is None else self.burn_in
+
+
+@dataclass
+class ChainOutput:
+    """Raw output of one chain.
+
+    Attributes
+    ----------
+    draws : one row per sweep: parameters and diagnostics.
+    vol_paths : variance path used in each sweep, shape (n_iter, n+1).
+    filtered_mean : filtered ``E[V_k]`` in each sweep, shape (n_iter, n+1).
+    jump_prob : filtered jump probabilities per sweep (Bates), shape (n_iter, n).
+    rejected : number of numerically degenerate sweeps that were skipped.
+    runtime_s : wall time of the chain in seconds.
+    """
+
+    draws: pd.DataFrame
+    vol_paths: np.ndarray
+    filtered_mean: np.ndarray
+    jump_prob: np.ndarray | None
+    rejected: int
+    runtime_s: float
+
+
+class GibbsSampler:
+    """One chain of the particle-filter Gibbs sampler.
+
+    Parameters
+    ----------
+    model : ``"heston"`` or ``"bates"``.
+    priors : prior hyper-parameters.
+    config : sampler settings.
+    """
+
+    def __init__(self, model: str, priors: Priors, config: SamplerConfig) -> None:
+        """Store the model, priors and settings."""
+        if model not in ("heston", "bates"):
+            raise ValueError("model must be 'heston' or 'bates'")
+        self.model = model
+        self.priors = priors
+        self.config = config
+        self.filter = ParticleFilter(config.n_particles, config.resampling,
+                                     config.jump_proposal_prob)
+
+    @property
+    def param_names(self) -> tuple[str, ...]:
+        """Names of the sampled parameters."""
+        return BATES_PARAMS if self.model == "bates" else HESTON_PARAMS
+
+    def _jump_step(self, fr, R: np.ndarray, params: Params, T: float,
+                   conj: ConjugateSampler, rng: np.random.Generator):
+        """Update jumps: return (adjusted returns, jump parameters, number of jumps)."""
+        if self.config.jump_update == "gibbs":
+            J, Z = fr.jump_draw, fr.size_draw
+            jd = conj.draw_jump_params(J, Z, T, rng)
+            new = dict(lam=jd.lam, mu_j=jd.mu_j, sigma_j=max(jd.sigma_j, 1e-6))
+            return R * np.exp(-J * Z), new, float(J.sum())
+        p, zm, z2 = fr.jump_prob, fr.jump_mean, fr.jump_m2
+        total = p.sum()
+        if total > 1e-12:
+            mu_j = float(p @ zm / total)
+            var_j = float(p @ (z2 - 2.0 * mu_j * zm + mu_j ** 2) / total)
+        else:
+            mu_j, var_j = params.mu_j, params.sigma_j ** 2
+        new = dict(lam=total / T, mu_j=mu_j, sigma_j=float(np.sqrt(max(var_j, 1e-12))))
+        return R * (1.0 - p * (1.0 - np.exp(-zm))), new, float(total)
+
+    def run(self, prices: np.ndarray, dt: float, seed: int | None = None,
+            init: Params | None = None, progress: bool | ProgressFn = False,
+            label: str = "") -> ChainOutput:
+        """Run the chain.
+
+        Parameters
+        ----------
+        prices : asset prices ``S_0..S_n`` equally spaced by ``dt``.
+        dt : time step in years.
+        seed : random seed.
+        init : starting parameters (default: prior means).
+        progress : ``True`` to print progress, or a callback ``f(iteration, info)``.
+        label : prefix for printed progress lines.
+
+        Returns
+        -------
+        ChainOutput
+        """
+        cfg, pr = self.config, self.priors
+        rng = np.random.default_rng(seed)
+        conj = ConjugateSampler(pr, dt)
+        R = prices[1:] / prices[:-1]
+        n = R.size
+        T = n * dt
+        start = pr.initial_params(self.model, dt).to_dict()
+        if init is not None:
+            start.update(init.to_dict())
+        params = make_params(self.model, start)
+        names = list(self.param_names)
+        extra = ["loglik", "v_T", "v_T_sd", "min_ess"]
+        if self.model == "bates":
+            extra.append("n_jumps")
+        rows = np.empty((cfg.n_iter, len(names) + len(extra)))
+        vol_paths = np.empty((cfg.n_iter, n + 1))
+        filt_mean = np.empty((cfg.n_iter, n + 1))
+        jump_prob = np.empty((cfg.n_iter, n)) if self.model == "bates" else None
+        rejected, t0 = 0, time.time()
+
+        for it in range(cfg.n_iter):
+            fr = self.filter.run(R, params, dt, rng, store_cloud=cfg.path == "ffbs",
+                                 v0_mean=pr.v0_mean, v0_sd=pr.v0_sd)
+            jump_kw, n_jumps, R_adj = {}, 0.0, R
+            if self.model == "bates":
+                R_adj, jump_kw, n_jumps = self._jump_step(fr, R, params, T, conj, rng)
+                jump_prob[it] = fr.jump_prob
+
+            if cfg.path == "ffbs":
+                v = self.filter.backward_sample(fr, R_adj, params, dt, rng)
+            else:
+                v = fr.v_mean
+
+            mu = conj.draw_mu(R_adj, v, rng)
+            vd = conj.draw_variance_params(v, rng)
+            rho = conj.draw_rho(R_adj, v, mu, vd.kappa, vd.theta, rng)
+            proposal = dict(mu=mu, kappa=vd.kappa, theta=vd.theta, sigma=vd.sigma,
+                            rho=float(np.clip(rho, -0.999, 0.999)), **jump_kw)
+            if all(np.isfinite(x) for x in proposal.values()) and proposal["sigma"] > 0:
+                params = make_params(self.model, proposal)
+            else:
+                rejected += 1
+
+            row = [getattr(params, p) for p in names] + [fr.loglik, fr.v_mean[-1], fr.v_sd[-1],
+                                                          fr.ess.min()]
+            rows[it] = row + ([n_jumps] if self.model == "bates" else [])
+            vol_paths[it] = v
+            filt_mean[it] = fr.v_mean
+            self._report(progress, it, dict(zip(names + extra, rows[it], strict=False)), t0, label)
+
+        return ChainOutput(pd.DataFrame(rows, columns=names + extra), vol_paths, filt_mean,
+                           jump_prob, rejected, time.time() - t0)
+
+    def _report(self, progress: bool | ProgressFn, it: int, info: dict[str, float],
+                t0: float, label: str) -> None:
+        """Print or forward progress information for sweep ``it``."""
+        if not progress:
+            return
+        info = {**info, "elapsed": time.time() - t0}
+        if callable(progress):
+            progress(it, info)
+            return
+        n = self.config.n_iter
+        if it == 0 or (it + 1) % max(1, n // 20) == 0:
+            txt = " ".join(f"{p}={info[p]:.4g}" for p in self.param_names)
+            print(f"{label}[{it + 1:5d}/{n}] {txt}  ({info['elapsed']:.0f}s)", flush=True)
+
+
+def _run_chain(job: tuple) -> ChainOutput:
+    """Run one chain in a worker process (module-level so it can be pickled)."""
+    sampler, prices, dt, seed, init, progress, label = job
+    return sampler.run(prices, dt, seed, init, progress, label)
 
 
 @dataclass
 class PosteriorResult:
+    """Posterior sample from one or more chains.
+
+    Attributes
+    ----------
+    model : ``"heston"`` or ``"bates"``.
+    dt : time step in years.
+    burn_in : sweeps discarded per chain.
+    chains : raw output of each chain.
+    settings : sampler settings and priors, for the record.
+    """
+
     model: str
     dt: float
     burn_in: int
-    chain: pd.DataFrame                 # every sweep (incl. burn-in)
-    vol_paths: np.ndarray               # variance path used in each sweep, (n_iter, n+1)
-    filtered_mean: np.ndarray           # filtered E[V_k] in each sweep, (n_iter, n+1)
-    jump_prob: Optional[np.ndarray]     # filtered P(J_k=1) in each sweep (Bates)
-    settings: Dict = field(default_factory=dict)
+    chains: list[ChainOutput]
+    settings: dict = field(default_factory=dict)
 
     @property
-    def param_names(self) -> Sequence[str]:
+    def param_names(self) -> tuple[str, ...]:
+        """Names of the model parameters."""
         return BATES_PARAMS if self.model == "bates" else HESTON_PARAMS
 
     @property
+    def n_chains(self) -> int:
+        """Number of chains."""
+        return len(self.chains)
+
+    @property
+    def chain(self) -> pd.DataFrame:
+        """All sweeps of all chains, with ``chain`` and ``iter`` columns."""
+        frames = [c.draws.assign(chain=i, iter=np.arange(len(c.draws)))
+                  for i, c in enumerate(self.chains)]
+        return pd.concat(frames, ignore_index=True)
+
+    @property
     def samples(self) -> pd.DataFrame:
-        """Posterior draws after burn-in."""
-        return self.chain.iloc[self.burn_in:].reset_index(drop=True)
+        """Posterior draws after burn-in, chains stacked."""
+        return pd.concat([c.draws.iloc[self.burn_in:] for c in self.chains], ignore_index=True)
+
+    def _stack(self, attr: str) -> np.ndarray:
+        """Stack a per-sweep array attribute of all chains after burn-in."""
+        return np.concatenate([getattr(c, attr)[self.burn_in:] for c in self.chains])
+
+    @property
+    def vol_paths(self) -> np.ndarray:
+        """Variance paths used after burn-in, shape (n_draws, n+1)."""
+        return self._stack("vol_paths")
 
     @property
     def variance_path(self) -> np.ndarray:
-        """Posterior mean of the latent variance path."""
-        return self.filtered_mean[self.burn_in:].mean(axis=0)
+        """Posterior mean of the filtered variance, shape (n+1,)."""
+        return self._stack("filtered_mean").mean(axis=0)
 
     @property
-    def v_final(self) -> tuple:
-        """Mean and sd of the latent variance at the last observation (use as v0 for pricing).
+    def jump_prob(self) -> np.ndarray | None:
+        """Posterior mean jump probability per day (Bates), shape (n,)."""
+        return self._stack("jump_prob").mean(axis=0) if self.model == "bates" else None
 
-        The sd combines the within-sweep filter spread and the between-sweep
-        (parameter) uncertainty.
-        """
+    @property
+    def v_final(self) -> tuple[float, float]:
+        """Mean and sd of the variance at the last date (filter + parameter uncertainty)."""
         s = self.samples
-        m = s["v_T"].to_numpy()
-        sd = s["v_T_sd"].to_numpy()
+        m, sd = s["v_T"].to_numpy(), s["v_T_sd"].to_numpy()
         return float(m.mean()), float(np.sqrt(np.mean(sd ** 2) + m.var()))
 
-    def point_estimate(self) -> Union[HestonParams, BatesParams]:
-        s = self.samples
-        kw = {p: float(s[p].mean()) for p in self.param_names}
-        return BatesParams(**kw) if self.model == "bates" else HestonParams(**kw)
+    def point_estimate(self) -> Params:
+        """Return the posterior-mean parameters."""
+        return make_params(self.model, self.samples[list(self.param_names)].mean().to_dict())
 
-    def summary(self, true_values: Optional[Union[Dict[str, float], HestonParams]] = None,
+    def summary(self, true_values: dict[str, float] | Params | None = None,
                 ci: float = 0.95) -> pd.DataFrame:
+        """Posterior summary table.
+
+        Parameters
+        ----------
+        true_values : optional true parameters (adds error and CI coverage).
+        ci : credible-interval mass.
+
+        Returns
+        -------
+        DataFrame indexed by parameter with mean, sd, median, quantiles, ESS
+        (summed over chains) and R-hat (if more than one chain).
+        """
         if isinstance(true_values, HestonParams):
             true_values = true_values.to_dict()
         lo, hi = 50 * (1 - ci), 50 * (1 + ci)
         rows = []
         for p in self.param_names:
-            x = self.samples[p].to_numpy()
-            row = {
-                "param": p, "mean": x.mean(), "sd": x.std(ddof=1), "median": np.median(x),
-                f"q{lo:g}": np.percentile(x, lo), f"q{hi:g}": np.percentile(x, hi),
-                "ess": effective_sample_size(x),
-            }
+            per_chain = [c.draws[p].to_numpy()[self.burn_in:] for c in self.chains]
+            x = np.concatenate(per_chain)
+            row = {"param": p, "mean": x.mean(), "sd": x.std(ddof=1), "median": np.median(x),
+                   f"q{lo:g}": np.percentile(x, lo), f"q{hi:g}": np.percentile(x, hi),
+                   "ess": sum(effective_sample_size(c) for c in per_chain)}
+            if self.n_chains > 1:
+                row["r_hat"] = gelman_rubin(per_chain)
             if true_values is not None and p in true_values:
                 tv = true_values[p]
                 row["true"] = tv
-                row["rel_err_%"] = 100 * abs(x.mean() - tv) / abs(tv) if tv != 0 else np.nan
+                row["rel_err_%"] = 100 * abs(x.mean() - tv) / abs(tv) if tv else np.nan
                 row["in_ci"] = bool(row[f"q{lo:g}"] <= tv <= row[f"q{hi:g}"])
             rows.append(row)
         return pd.DataFrame(rows).set_index("param")
 
     def save(self, prefix: str) -> None:
-        """Write ``<prefix>_chain.csv``, ``<prefix>_variance.csv`` and ``<prefix>_summary.csv``."""
-        self.chain.to_csv(f"{prefix}_chain.csv", index_label="iter")
-        pd.DataFrame({
-            "posterior_mean_variance": self.variance_path,
-            "posterior_sd_variance": self.filtered_mean[self.burn_in:].std(axis=0),
-        }).to_csv(f"{prefix}_variance.csv", index_label="k")
+        """Write ``<prefix>_chain.csv``, ``<prefix>_variance.csv`` and ``<prefix>_summary.csv``.
+
+        Parameters
+        ----------
+        prefix : output path prefix.
+        """
+        self.chain.to_csv(f"{prefix}_chain.csv", index=False)
+        fm = self._stack("filtered_mean")
+        pd.DataFrame({"posterior_mean_variance": fm.mean(axis=0),
+                      "posterior_sd_variance": fm.std(axis=0)}).to_csv(
+            f"{prefix}_variance.csv", index_label="k")
         self.summary().to_csv(f"{prefix}_summary.csv")
 
 
-def _initial_params(model: str, pr: Priors, dt: float) -> Union[HestonParams, BatesParams]:
-    mu = (pr.eta_mean - 1.0) / dt
-    kappa = max((1.0 - pr.beta_mean[1]) / dt, 1e-2)
-    theta = max(pr.beta_mean[0] / (kappa * dt), 1e-4)
-    sigma = float(np.sqrt(pr.sigma_b / max(pr.sigma_a - 1.0, 1e-3)))
-    w0 = pr.omega_b / max(pr.omega_a - 1.0, 1e-3)
-    rho = float(np.clip(pr.psi_mean / np.sqrt(pr.psi_mean ** 2 + w0), -0.95, 0.95))
-    base = dict(mu=mu, kappa=kappa, theta=theta, sigma=sigma, rho=rho)
-    if model == "bates":
-        return BatesParams(**base, lam=pr.lam_a / pr.lam_b, mu_j=pr.mu_j_mean,
-                           sigma_j=float(np.sqrt(pr.sigma_j_b / max(pr.sigma_j_a - 1.0, 1e-3))))
-    return HestonParams(**base)
-
-
-def estimate(
-    prices: np.ndarray,
-    dt: float,
-    model: str = "heston",
-    priors: Optional[Priors] = None,
-    n_iter: int = 1000,
-    burn_in: Optional[int] = None,
-    n_particles: int = 1000,
-    init: Optional[Union[HestonParams, BatesParams]] = None,
-    path: str = "ffbs",
-    resampling: str = "smooth",
-    jump_update: str = "gibbs",
-    jump_proposal_prob: float = 0.1,
-    seed: Optional[int] = None,
-    progress: Union[bool, Callable[[int, Dict], None]] = False,
-) -> PosteriorResult:
-    """Run the particle-filter / Gibbs sampler.
+class Estimator:
+    """User-facing estimator: runs independent chains, optionally in parallel.
 
     Parameters
     ----------
-    prices : array of asset prices ``S_0..S_n`` (equally spaced by ``dt`` years).
     model : ``"heston"`` or ``"bates"``.
-    priors : :class:`Priors`; defaults to weakly informative ``Priors.from_beliefs(dt)``.
-    n_iter, burn_in : number of sweeps and how many to discard (default ``n_iter // 4``).
-    n_particles : particles in the filter.
-    path : ``"ffbs"`` (backward-sampled trajectory, recommended) or ``"mean"``
-        (filtered mean path, as in the thesis – tends to under-estimate ``sigma``
-        because the filtered mean is smoother than the true variance).
-    resampling : ``"smooth"`` (thesis' refined resampling) or ``"systematic"``.
-    jump_update : ``"gibbs"`` – sample jump times/sizes and draw ``(lam, mu_j,
-        sigma_j)`` from conjugate posteriors (gives genuine posterior
-        uncertainty), or ``"moments"`` – the thesis' moment estimates
-        (Eqs. 80–83), corrected to divide by the time span and to use within-
-        step jump-size variance.
+    priors : prior hyper-parameters (default: weakly informative, built from ``dt`` at fit time).
+    config : sampler settings.
+
+    Examples
+    --------
+    >>> est = Estimator("heston", config=SamplerConfig(n_iter=2000))
+    >>> post = est.fit(prices, dt=1/252, n_chains=4, n_jobs=4, seed=0)
+    >>> post.summary()
     """
-    if model not in ("heston", "bates"):
-        raise ValueError("model must be 'heston' or 'bates'")
-    if path not in ("ffbs", "mean"):
-        raise ValueError("path must be 'ffbs' or 'mean'")
-    if jump_update not in ("gibbs", "moments"):
-        raise ValueError("jump_update must be 'gibbs' or 'moments'")
-    if path == "mean":
-        warnings.warn(
-            "path='mean' regresses on the filtered-mean variance path (thesis method). Its "
-            "increments are dominated by the rho-correlated propagation step, so rho drifts "
-            "towards -1/+1 and sigma is biased low unless the priors are very tight. "
-            "Use path='ffbs' for inference.", stacklevel=2)
-    prices = np.asarray(prices, dtype=float)
-    if prices.ndim != 1 or prices.size < 10 or np.any(prices <= 0):
-        raise ValueError("prices must be a 1-D array of > 10 positive values")
-    rng = np.random.default_rng(seed)
-    pr = priors if priors is not None else Priors.from_beliefs(dt)
-    burn_in = n_iter // 4 if burn_in is None else burn_in
-    if not 0 <= burn_in < n_iter:
-        raise ValueError("burn_in must be in [0, n_iter)")
 
-    R = prices[1:] / prices[:-1]
-    n = R.size
-    T = n * dt
-    params = init if init is not None else _initial_params(model, pr, dt)
-    if model == "bates" and not isinstance(params, BatesParams):
-        params = BatesParams(**params.to_dict(), lam=pr.lam_a / pr.lam_b, mu_j=pr.mu_j_mean, sigma_j=0.1)
-    if model == "heston" and isinstance(params, BatesParams):
-        params = HestonParams(**{p: getattr(params, p) for p in HESTON_PARAMS})
+    def __init__(self, model: str = "heston", priors: Priors | None = None,
+                 config: SamplerConfig | None = None) -> None:
+        """Store the model, priors and settings."""
+        if model not in ("heston", "bates"):
+            raise ValueError("model must be 'heston' or 'bates'")
+        self.model = model
+        self.priors = priors
+        self.config = config or SamplerConfig()
 
-    names = list(BATES_PARAMS if model == "bates" else HESTON_PARAMS)
-    cols = names + ["loglik", "v_T", "v_T_sd", "min_ess"] + (["n_jumps"] if model == "bates" else [])
-    chain = np.empty((n_iter, len(cols)))
-    vol_paths = np.empty((n_iter, n + 1))
-    filt_mean = np.empty((n_iter, n + 1))
-    jprob = np.empty((n_iter, n)) if model == "bates" else None
-    t0 = time.time()
-    n_rejected = 0
+    def fit(self, prices: Sequence[float], dt: float, n_chains: int = 1,
+            n_jobs: int | None = None, seed: int | None = None,
+            init: Params | None = None, progress: bool | ProgressFn = False
+            ) -> PosteriorResult:
+        """Estimate the posterior from a price series.
 
-    for it in range(n_iter):
-        fr = run_filter(R, params, dt, n_particles, rng, resampling, jump_proposal_prob,
-                        store_cloud=(path == "ffbs"), v0_mean=pr.v0_mean, v0_sd=pr.v0_sd)
+        Parameters
+        ----------
+        prices : asset prices ``S_0..S_n`` equally spaced by ``dt`` years.
+        dt : time step in years (1/252 for daily data).
+        n_chains : number of independent chains (>1 enables R-hat).
+        n_jobs : worker processes for the chains (``None`` = all cores).
+        seed : master seed; each chain gets an independent child seed.
+        init : starting parameters for every chain (default: prior means).
+        progress : ``True`` prints progress of each chain; a callback is only
+            supported with a single chain or ``n_jobs=1``.
 
-        jump_kw = {}
-        n_jumps = 0.0
-        if model == "bates":
-            if jump_update == "gibbs":
-                Jd, Zd = fr.jump_draw, fr.size_draw
-                R_adj = R * np.exp(-Jd * Zd)
-                jd = bayes.draw_jump_params(Jd, Zd, T, pr, rng)
-                jump_kw = dict(lam=jd.lam, mu_j=jd.mu_j, sigma_j=max(jd.sigma_j, 1e-6))
-                n_jumps = float(Jd.sum())
-            else:
-                p, zm, z2 = fr.jump_prob, fr.jump_size_mean, fr.jump_size_m2
-                # E[exp(-J Z)] with Z at its posterior mean
-                R_adj = R * (1.0 - p * (1.0 - np.exp(-zm)))
-                sp = p.sum()
-                lam = sp / T
-                if sp > 1e-12:
-                    mu_j = float(p @ zm / sp)
-                    var_j = float(p @ (z2 - 2 * mu_j * zm + mu_j ** 2) / sp)
-                else:
-                    mu_j, var_j = params.mu_j, params.sigma_j ** 2
-                jump_kw = dict(lam=lam, mu_j=mu_j, sigma_j=float(np.sqrt(max(var_j, 1e-12))))
-                n_jumps = float(sp)
-                Jd = (rng.random(n) < p).astype(int)
-            jprob[it] = fr.jump_prob
-        else:
-            R_adj = R
-            Jd = None
+        Returns
+        -------
+        PosteriorResult
+        """
+        prices = np.asarray(prices, dtype=np.float64)
+        if prices.ndim != 1 or prices.size < 10 or np.any(prices <= 0):
+            raise ValueError("prices must be a 1-D array of more than 10 positive values")
+        if self.config.path == "mean":
+            warnings.warn(
+                "path='mean' regresses on the filtered-mean variance path (thesis method); rho "
+                "drifts towards +/-1 and sigma is biased low unless priors are tight. "
+                "Use path='ffbs' for inference.", stacklevel=2)
+        priors = self.priors or Priors.from_beliefs(dt)
+        sampler = GibbsSampler(self.model, priors, self.config)
+        seeds = [int(s.generate_state(1)[0]) for s in np.random.SeedSequence(seed).spawn(n_chains)]
+        jobs = [(sampler, prices, dt, s, init, progress, f"chain {i} " if n_chains > 1 else "")
+                for i, s in enumerate(seeds)]
+        if callable(progress) and n_chains > 1 and n_jobs != 1:
+            raise ValueError("progress callbacks need n_chains=1 or n_jobs=1")
+        t0 = time.time()
+        chains = process_map(_run_chain, jobs, n_jobs) if n_chains > 1 else [_run_chain(jobs[0])]
+        settings = {**{k: getattr(self.config, k) for k in self.config.__dataclass_fields__},
+                    "burn_in": self.config.effective_burn_in, "n_chains": n_chains,
+                    "seed": seed, "priors": priors.to_dict(), "runtime_s": time.time() - t0,
+                    "rejected_sweeps": sum(c.rejected for c in chains)}
+        return PosteriorResult(self.model, dt, self.config.effective_burn_in, chains, settings)
 
-        if path == "ffbs":
-            v = backward_sample(fr.cloud, R_adj, params, dt, rng)
-        else:
-            v = fr.v_mean
-
-        mu = bayes.draw_mu(R_adj, v, dt, pr, rng)
-        vd = bayes.draw_kappa_theta_sigma(v, dt, pr, rng)
-        rho = bayes.draw_rho(R_adj, v, dt, mu, vd.kappa, vd.theta, pr, rng)
-        base = dict(mu=mu, kappa=vd.kappa, theta=vd.theta, sigma=vd.sigma,
-                    rho=float(np.clip(rho, -0.999, 0.999)))
-        new = {**base, **jump_kw}
-        if all(np.isfinite(x) for x in new.values()) and new["sigma"] > 0:
-            params = BatesParams(**new) if model == "bates" else HestonParams(**base)
-        else:  # numerically degenerate sweep: keep the previous state
-            n_rejected += 1
-
-        row = [getattr(params, p) for p in names] + [fr.loglik, fr.v_mean[-1], fr.v_sd[-1], fr.ess.min()]
-        if model == "bates":
-            row.append(n_jumps)
-        chain[it] = row
-        vol_paths[it] = v
-        filt_mean[it] = fr.v_mean
-
-        if progress:
-            info = dict(zip(cols, row), elapsed=time.time() - t0)
-            if callable(progress):
-                progress(it, info)
-            elif (it + 1) % max(1, n_iter // 20) == 0 or it == 0:
-                txt = " ".join(f"{p}={info[p]:.4g}" for p in names)
-                print(f"[{it + 1:5d}/{n_iter}] {txt}  ({info['elapsed']:.0f}s)", flush=True)
-
-    settings = dict(n_iter=n_iter, burn_in=burn_in, n_particles=n_particles, path=path,
-                    resampling=resampling, jump_update=jump_update, seed=seed,
-                    priors=pr.to_dict(), runtime_s=time.time() - t0, rejected_sweeps=n_rejected)
-    return PosteriorResult(model, dt, burn_in, pd.DataFrame(chain, columns=cols),
-                           vol_paths, filt_mean, jprob, settings)
+    def with_config(self, **changes) -> Estimator:
+        """Return a copy of this estimator with some sampler settings changed."""
+        return Estimator(self.model, self.priors, replace(self.config, **changes))

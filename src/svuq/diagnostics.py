@@ -1,14 +1,23 @@
-"""MCMC diagnostics and posterior summaries."""
+"""MCMC diagnostics."""
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
 
 def autocorrelation(x: np.ndarray) -> np.ndarray:
-    """Normalised autocorrelation function via FFT."""
+    """Compute the normalised autocorrelation function via FFT.
+
+    Parameters
+    ----------
+    x : 1-D chain.
+
+    Returns
+    -------
+    Autocorrelations at lags ``0..n-1``.
+    """
     x = np.asarray(x, dtype=float) - np.mean(x)
     n = x.size
     if n < 2 or np.allclose(x, 0):
@@ -19,7 +28,16 @@ def autocorrelation(x: np.ndarray) -> np.ndarray:
 
 
 def effective_sample_size(x: np.ndarray) -> float:
-    """ESS using Geyer's initial positive sequence estimator."""
+    """Estimate the effective sample size with Geyer's initial positive sequence.
+
+    Parameters
+    ----------
+    x : 1-D chain.
+
+    Returns
+    -------
+    Effective number of independent draws.
+    """
     x = np.asarray(x, dtype=float)
     n = x.size
     if n < 4 or np.ptp(x) == 0:
@@ -35,16 +53,35 @@ def effective_sample_size(x: np.ndarray) -> float:
 
 
 def gelman_rubin(chains: Sequence[np.ndarray]) -> float:
-    """Potential scale reduction factor R-hat for several chains of one parameter."""
+    """Compute the potential scale reduction factor R-hat.
+
+    Parameters
+    ----------
+    chains : equally long chains of one parameter.
+
+    Returns
+    -------
+    R-hat (values close to 1 indicate convergence).
+    """
     c = np.asarray([np.asarray(ch, dtype=float) for ch in chains])
-    m, n = c.shape
-    W = c.var(axis=1, ddof=1).mean()
-    B = n * c.mean(axis=1).var(ddof=1)
-    var_hat = (n - 1) / n * W + B / n
-    return float(np.sqrt(var_hat / W)) if W > 0 else np.nan
+    _, n = c.shape
+    within = c.var(axis=1, ddof=1).mean()
+    between = n * c.mean(axis=1).var(ddof=1)
+    var_hat = (n - 1) / n * within + between / n
+    return float(np.sqrt(var_hat / within)) if within > 0 else float("nan")
 
 
 def mse(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute the mean squared error over the common length of two series.
+
+    Parameters
+    ----------
+    a, b : series to compare.
+
+    Returns
+    -------
+    Mean squared difference.
+    """
     a, b = np.asarray(a), np.asarray(b)
     m = min(a.size, b.size)
     return float(np.mean((a[:m] - b[:m]) ** 2))

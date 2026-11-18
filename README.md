@@ -14,10 +14,6 @@ Models*. It does three things:
    prices, either exactly (posterior Monte Carlo) or with a polynomial chaos
    surrogate that also gives Sobol sensitivity indices.
 
-The original research scripts are kept unchanged in [`legacy/`](legacy). The
-problems found in them, and what was changed, are listed in
-[`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md). Read that first if you are
-comparing with the thesis results.
 
 ## Layout
 
@@ -124,39 +120,7 @@ python scripts/forecast_volatility.py --data data/raw/sp500_historical.xlsx --mo
 Each run writes its chains, summary, variance path, reports and figures to
 `results/`.
 
-## Performance
 
-Timings are for 3 years of daily data on one core of the development
-machine.
-
-| | original scripts | `svuq` |
-|---|---|---|
-| Gibbs sweep, 200 particles | 1.44 s | 9–14 ms (**100–150×**) |
-| Gibbs sweep, 1000 particles | 32.7 s | 44–85 ms (**390–740×**) |
-| 4 chains × 2000 sweeps, 1000 particles | ~3 days (serial) | ~3 min (4 processes) |
-| 500 posterior draws × 36 strikes | ~20–60 s (adaptive quadrature per price) | ~0.15 s |
-| Online volatility update (100 draws × 500 particles) | not available | ~3–7 ms |
-
-The sweep timings include drawing a full variance path by backward sampling,
-which the original code did not do. The lower figures are with
-`resampling="systematic"`; the default `"smooth"` matches the thesis.
-
-How the speed was achieved:
-- **Compiled kernels.** The particle filter, both resampling schemes and the
-  backward sampler are numba kernels. They are compiled once and cached on
-  disk, and release the GIL.
-- **Parallel chains.** `Estimator.fit(n_chains=…, n_jobs=…)` runs chains in
-  separate processes. That also gives R-hat convergence checks.
-- **Threaded forecaster.** The `VolatilityForecaster` filters one cloud per
-  posterior draw in threads.
-- **Vectorised pricing.** All strikes and parameter sets share one composite
-  Gauss–Legendre grid, so a whole posterior × option-chain grid costs two
-  matrix products. It agrees with adaptive quadrature to 1e-8 and with
-  QuantLib to 1e-8 (tests).
-- **No chaospy in the PCE.** It uses an orthonormal Hermite basis in numpy;
-  mean, variance and Sobol indices come straight from the coefficients.
-- **Reproducibility.** Every kernel call is seeded from a
-  `numpy.random.Generator`, so results are reproducible for a given seed.
 
 ## Method in brief
 
